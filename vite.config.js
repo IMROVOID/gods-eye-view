@@ -2558,16 +2558,39 @@ function sendOverpassResponse(res, payload, cacheStatus = 'MISS') {
  * @param {number} [maxResponseBytes] Endpoint-specific response cap.
  * @returns {Promise<{status:number,body:string,contentType:string,endpoint:string,rateLimited:boolean}>}
  */
-async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPONSE_BYTES) {
+/**
+ * True only for an upstream response that is actually Overpass data.
+ *
+ * The proxy caches on this and serves stale on its negation, so the two
+ * decisions cannot drift apart: a payload that is not data must never be
+ * written to the cache and must always be eligible for a stale replacement.
+ * @param {{status: number, rateLimited?: boolean, runtimeError?: boolean}} payload
+ * @returns {boolean}
+ */
+export function overpassPayloadIsData(payload) {
+  const status = Number(payload?.status);
+  return Number.isFinite(status)
+    && status >= 200 && status < 300
+    && !payload.rateLimited
+    && !payload.runtimeError;
+}
+
+export async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPONSE_BYTES, {
+  endpoints = OVERPASS_UPSTREAMS,
+  fetchImpl = fetch,
+  readBody = readResponseTextCapped,
+  simplify = simplifyOverpassPayloadBody,
+} = {}) {
   let lastError = null;
   let lastRateLimitPayload = null;
+  let lastRefusalPayload = null;
 
-  for (const endpoint of OVERPASS_UPSTREAMS) {
+  for (const endpoint of endpoints) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
 
     try {
-      const upstream = await fetch(endpoint, {
+      const upstream = await fetchImpl(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -2577,7 +2600,7 @@ async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPON
         signal: controller.signal,
       });
 
-      const responseBody = await readResponseTextCapped(upstream, maxResponseBytes);
+      const responseBody = await readBody(upstream, maxResponseBytes);
       const contentType = upstream.headers.get('content-type') || 'application/json';
       const status = upstream.status;
       const rateLimited = status === 429 || overpassLooksRateLimited(responseBody);
@@ -2601,14 +2624,23 @@ async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPON
         lastError = new Error(`Overpass runtime error (${endpoint})`);
         continue;
       }
-      if (status >= 500) {
+      // Anything but 2xx is this mirror declining, not an answer. Only 5xx used
+      // to rotate, so a 4xx ended the fan-out and was returned — and cached —
+      // as data: overpass-api.de and its lz4 alias answer 406 to this proxy's
+      // User-Agent while kumi.systems and private.coffee answer 200 to the very
+      // same request, so every Overpass-backed layer failed on an Apache error
+      // page with two healthy mirrors untried. The first refusal is kept so a
+      // genuinely bad query still reports what upstream said, but only after
+      // every mirror has had the chance to answer it.
+      if (status < 200 || status >= 300) {
+        if (!lastRefusalPayload) lastRefusalPayload = payload;
         lastError = new Error(`Overpass upstream returned ${status} (${endpoint})`);
         continue;
       }
 
       // Success: decimate giant boundary geometry before it reaches the cache,
       // the disk, or the client (what makes the 32 MB read cap safe to hold).
-      payload.body = simplifyOverpassPayloadBody(payload.body);
+      payload.body = simplify(payload.body);
       return payload;
     } catch (error) {
       lastError = error;
@@ -2618,6 +2650,7 @@ async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPON
   }
 
   if (lastRateLimitPayload) return lastRateLimitPayload;
+  if (lastRefusalPayload) return lastRefusalPayload;
   throw lastError || new Error('All Overpass upstreams failed');
 }
 
@@ -2710,7 +2743,11 @@ function overpassProxy() {
           _overpassConcurrent += 1;
           const requestPromise = fetchOverpassPayload(safeBody)
             .then((payload) => {
-              if (payload.status < 500 && !payload.rateLimited && !payload.runtimeError) {
+              // Only a 2xx is data. `< 500` cached every 4xx, so one mirror's
+              // refusal was written to memory AND disk — and boundary-class
+              // queries hold a month-long TTL, so a single 406 outlived the
+              // outage that caused it.
+              if (overpassPayloadIsData(payload)) {
                 const entry = { ...payload, cachedAt: Date.now() };
                 _overpassCache.set(cacheKey, entry);
                 trimOverpassCache();
@@ -2728,7 +2765,7 @@ function overpassProxy() {
           // Degraded upstream (rate-limited on every mirror / 5xx / runtime
           // error): last-good roads beat an empty layer — serve stale from
           // memory or disk at ANY age before surfacing the failure.
-          if (payload.rateLimited || payload.runtimeError || payload.status >= 500) {
+          if (!overpassPayloadIsData(payload)) {
             const stale = _overpassCache.get(cacheKey) || await readOverpassDisk(cacheKey, Infinity);
             if (stale) {
               sendOverpassResponse(res, stale, 'STALE');

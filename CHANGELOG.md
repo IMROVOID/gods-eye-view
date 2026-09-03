@@ -5,6 +5,16 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ## [Unreleased]
 
+### Fixed
+
+- The Overpass proxy now rotates to the next mirror on any non-2xx upstream
+  response, not only on 5xx. `overpass-api.de` and its `lz4` alias answer 406 to
+  the proxy's User-Agent while two of the configured mirrors answer 200 to the
+  identical request, so the fan-out stopped at the first refusal with healthy
+  mirrors untried. The refusal was also cached to memory and disk and served as
+  data — boundary-class queries hold a month-long TTL — which affected every
+  Overpass-backed feature: road geometry, annotation outlines and place lookup.
+
 ## [0.1.1] — 2026-09-01 — Installation and live-data fixes
 
 ### Changed
