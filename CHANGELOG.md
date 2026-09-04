@@ -14,6 +14,9 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
   mirrors untried. The refusal was also cached to memory and disk and served as
   data — boundary-class queries hold a month-long TTL — which affected every
   Overpass-backed feature: road geometry, annotation outlines and place lookup.
+- Existing cached refusals are now ignored immediately, including during
+  stale-data fallback. Concurrent identical requests share the same last-good
+  fallback when all mirrors refuse, without duplicating upstream requests.
 
 ## [0.1.1] — 2026-09-01 — Installation and live-data fixes
 

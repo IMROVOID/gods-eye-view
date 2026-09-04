@@ -342,11 +342,14 @@ function overpassDiskPath(cacheKey) {
  * serve-stale path when every mirror is down).
  * @returns {Promise<?Object>} Payload with cachedAt, or null.
  */
-async function readOverpassDisk(cacheKey, maxAgeMs) {
+export async function readOverpassDisk(cacheKey, maxAgeMs) {
   try {
     const raw = await fsp.readFile(overpassDiskPath(cacheKey), 'utf8');
     const payload = JSON.parse(raw);
     if (!payload || typeof payload.body !== 'string' || !Number.isFinite(payload.cachedAt)) return null;
+    // Older versions persisted 4xx refusals with normal data TTLs. Ignore
+    // them on both fresh and stale reads so an upgrade can recover immediately.
+    if (!overpassPayloadIsData(payload)) return null;
     if (Date.now() - payload.cachedAt > maxAgeMs) return null;
     return payload;
   } catch {
@@ -387,17 +390,23 @@ export async function resolveOverpassPreflight({
   cacheMs = OVERPASS_CACHE_MS,
 }) {
   const cached = memoryCache.get(cacheKey);
-  if (cached && now - cached.cachedAt <= cacheMs) return { source: 'HIT', payload: cached };
+  if (overpassPayloadIsData(cached) && now - cached.cachedAt <= cacheMs) return { source: 'HIT', payload: cached };
 
   const pending = inFlight.get(cacheKey);
   if (pending) return { source: 'INFLIGHT', payload: await pending };
 
   const disk = await readDisk();
-  if (disk) return { source: 'DISK', payload: disk };
+  if (overpassPayloadIsData(disk)) return { source: 'DISK', payload: disk };
 
   return allowUpstream()
     ? { source: 'UPSTREAM', payload: null }
     : { source: 'RATE_LIMITED', payload: null };
+}
+
+/** Return only last-good Overpass data, regardless of its age. */
+async function readStaleOverpass(cacheKey) {
+  const cached = _overpassCache.get(cacheKey);
+  return overpassPayloadIsData(cached) ? cached : readOverpassDisk(cacheKey, Infinity);
 }
 /** OSM routing (FOSSGIS OSRM) cache: profile|coords -> { payload, cachedAt }. */
 const ROUTE_CACHE_MS = 600000;
@@ -2548,17 +2557,6 @@ function sendOverpassResponse(res, payload, cacheStatus = 'MISS') {
 }
 
 /**
- * Try each Overpass upstream in order until one succeeds.
- *
- * Skips rate-limited or 5xx responses and falls through to the next
- * mirror. If all mirrors fail, returns the last rate-limited payload
- * (if any) or throws the last error.
- *
- * @param {string} body - URL-encoded Overpass QL query body.
- * @param {number} [maxResponseBytes] Endpoint-specific response cap.
- * @returns {Promise<{status:number,body:string,contentType:string,endpoint:string,rateLimited:boolean}>}
- */
-/**
  * True only for an upstream response that is actually Overpass data.
  *
  * The proxy caches on this and serves stale on its negation, so the two
@@ -2575,6 +2573,15 @@ export function overpassPayloadIsData(payload) {
     && !payload.runtimeError;
 }
 
+/**
+ * Try each mirror once, retaining response-size and per-mirror timeout caps.
+ * Refusals and body-level failures rotate; total failure returns the last
+ * rate-limit payload, otherwise the first refusal, or throws a network error.
+ * @param {string} body URL-encoded Overpass QL query body.
+ * @param {number} [maxResponseBytes] Endpoint-specific response cap.
+ * @param {object} [options] Server-only endpoint and I/O overrides for tests.
+ * @returns {Promise<{status:number,body:string,contentType:string,endpoint:string,rateLimited:boolean}>}
+ */
 export async function fetchOverpassPayload(body, maxResponseBytes = OVERPASS_MAX_RESPONSE_BYTES, {
   endpoints = OVERPASS_UPSTREAMS,
   fetchImpl = fetch,
@@ -2725,6 +2732,15 @@ function overpassProxy() {
             return;
           }
           if (preflight.source !== 'UPSTREAM') {
+            // A coalesced caller sees the same failure as the original request
+            // and must get the same last-good fallback, not the raw refusal.
+            if (!overpassPayloadIsData(preflight.payload)) {
+              const stale = await readStaleOverpass(cacheKey);
+              if (stale) {
+                sendOverpassResponse(res, stale, 'STALE');
+                return;
+              }
+            }
             if (preflight.source === 'DISK') {
               _overpassCache.set(cacheKey, preflight.payload);
               trimOverpassCache();
@@ -2766,7 +2782,7 @@ function overpassProxy() {
           // error): last-good roads beat an empty layer — serve stale from
           // memory or disk at ANY age before surfacing the failure.
           if (!overpassPayloadIsData(payload)) {
-            const stale = _overpassCache.get(cacheKey) || await readOverpassDisk(cacheKey, Infinity);
+            const stale = await readStaleOverpass(cacheKey);
             if (stale) {
               sendOverpassResponse(res, stale, 'STALE');
               return;
@@ -2776,7 +2792,7 @@ function overpassProxy() {
         } catch (e) {
           // Every mirror threw (network-level). Same serve-stale rule.
           const stale = cacheKey
-            ? (_overpassCache.get(cacheKey) || await readOverpassDisk(cacheKey, Infinity).catch(() => null))
+            ? await readStaleOverpass(cacheKey)
             : null;
           if (stale) {
             sendOverpassResponse(res, stale, 'STALE');
